@@ -79,6 +79,10 @@ export function scale(v: Vector3, s: number): Vector3 {
 	return { x: v.x * s, y: v.y * s, z: v.z * s }
 }
 
+export function subtract(a: Vector3, b: Vector3): Vector3 {
+    return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+}
+
 export function dot(a: Vector3, b: Vector3): number {
 	return a.x * b.x + a.y * b.y + a.z * b.z
 }
@@ -229,7 +233,7 @@ export function createDefaultAircraft(): { params: AircraftParameters; state: Ai
 		massKg: 1110, // ~2450 lb MTOW
 		wingAreaM2: 16.2, // 174 ft^2
 		wingSpanM: 11.0, // 36 ft 1 in
-		maxThrustN: 4500, // ~180 hp at ~30 m/s => P/V ≈ 4.5 kN
+        maxThrustN: 5500, // slight boost for better climb performance
 		parasiteDragCoefficient: 0.03,
 		clSlopePerRad: 5.7, // ~2π corrected for finite wing
 		oswaldEfficiency: 0.8
@@ -250,6 +254,8 @@ export class FlightDynamicsModel {
 	readonly params: AircraftParameters
 	readonly config: FdmConfig
 	state: AircraftState
+    private windEnuMetersPerSec: Vector3 = { x: 0, y: 0, z: 0 }
+    private aeroScale: { lift: number; drag: number } = { lift: 1, drag: 1 }
 
 	constructor(params: AircraftParameters, initialState: AircraftState, config: FdmConfig = DefaultFdmConfig) {
 		this.params = params
@@ -258,6 +264,15 @@ export class FlightDynamicsModel {
 		// Initialize quaternion from provided Euler if not identity
 		this.state.orientation = quaternionFromYawPitchRoll(initialState.yawRad, initialState.pitchRad, initialState.rollRad)
 	}
+
+    setWindEnuMetersPerSec(wind: Vector3): void {
+        this.windEnuMetersPerSec = { x: wind.x, y: wind.y, z: wind.z }
+    }
+
+    setAeroScale(scale: { lift?: number; drag?: number }): void {
+        if (scale.lift !== undefined && Number.isFinite(scale.lift)) this.aeroScale.lift = Math.max(0, scale.lift)
+        if (scale.drag !== undefined && Number.isFinite(scale.drag)) this.aeroScale.drag = Math.max(0, scale.drag)
+    }
 
 	update(dtSeconds: number, inputs: ControlInputs): void {
 		const { params, state } = this
@@ -291,8 +306,10 @@ export class FlightDynamicsModel {
 			const rBodyToEnu = matrixFromQuaternion(state.orientation)
 			const rEnuToBody = transpose3(rBodyToEnu)
 
+            // Air-relative velocity in ENU after accounting for environmental wind
+            const airRelativeVelocityEnu = subtract(state.velocityEnuMetersPerSec, this.windEnuMetersPerSec)
             // Velocity in body frame
-            const vBody = multiplyMatrixVector3(rEnuToBody, state.velocityEnuMetersPerSec)
+            const vBody = multiplyMatrixVector3(rEnuToBody, airRelativeVelocityEnu)
             const u = vBody.x
             const vSide = vBody.y
             const w = vBody.z
@@ -307,8 +324,8 @@ export class FlightDynamicsModel {
 			const aspectRatio = (params.wingSpanM * params.wingSpanM) / params.wingAreaM2
 			const cl = calculateLiftCoefficient(alpha, params.clSlopePerRad, this.config.stallAlphaRad)
 			const cd = calculateDragCoefficient(params.parasiteDragCoefficient, cl, aspectRatio, params.oswaldEfficiency)
-            const liftN = calculateLiftNewtons(cl, AIR_DENSITY_KG_M3, speedAero, params.wingAreaM2)
-            const dragN = calculateDragNewtons(cd, AIR_DENSITY_KG_M3, speedAero, params.wingAreaM2)
+	            const liftN = this.aeroScale.lift * calculateLiftNewtons(cl, AIR_DENSITY_KG_M3, speedAero, params.wingAreaM2)
+	            const dragN = this.aeroScale.drag * calculateDragNewtons(cd, AIR_DENSITY_KG_M3, speedAero, params.wingAreaM2)
 
 			// Forces in body frame
 			const thrustN = params.maxThrustN * clamp(inputs.throttle, 0, 1)

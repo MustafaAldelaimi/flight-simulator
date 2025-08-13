@@ -24,7 +24,8 @@ import {
     FlightDynamicsModel,
     createDefaultAircraft,
     DefaultFdmConfig,
-    type ControlInputs
+    type ControlInputs,
+    clamp
 } from './flightDynamics'
 import { flightStateBus } from './state'
 
@@ -59,6 +60,12 @@ const viewer = new Viewer(viewerContainer, {
     fullscreenButton: true,
     baseLayer
 })
+
+// Enable atmosphere and dynamic lighting
+viewer.scene.globe.enableLighting = true
+if (viewer.scene.skyAtmosphere) viewer.scene.skyAtmosphere.show = true
+if (viewer.scene.sun) viewer.scene.sun.show = true
+if (viewer.scene.moon) viewer.scene.moon.show = true
 
 // Starting location: above The Shard, London
 const startLon = -0.0865
@@ -109,15 +116,19 @@ const enuFromFixed = Transforms.eastNorthUpToFixedFrame(startPosition)
 
 // Flight dynamics setup
 const { params, state } = createDefaultAircraft()
-// Give a small initial forward speed to avoid immediate vertical drop
-state.velocityEnuMetersPerSec.x = 30
+// Give an initial forward speed to ensure immediate aerodynamic effectiveness
+state.velocityEnuMetersPerSec.x = 55
 // Align FDM yaw with initial visual heading (east)
 state.yawRad = CesiumMath.toRadians(90)
 const fdm: FlightDynamicsModel = new FlightDynamicsModel(params, state, DefaultFdmConfig)
 ;(window as any).FDM = fdm
 
+// Apply a simple constant wind in ENU (m/s). Example: light breeze from NW toward SE
+fdm.setWindEnuMetersPerSec({ x: 3, y: -2, z: 0 })
+
 // Simple keyboard inputs
 const inputs: ControlInputs = { elevator: 0, ailerons: 0, rudder: 0, throttle: 0.75 }
+let pitchHoldTargetDeg: number | null = null
 const keyState = new Set<string>()
 window.addEventListener('keydown', e => {
     keyState.add(e.key)
@@ -127,23 +138,171 @@ window.addEventListener('keyup', e => {
 })
 
 function updateInputsFromKeyboard() {
+    // Only modify a control axis when relevant keys are pressed; otherwise keep programmatic value
     // Elevator: ArrowUp (pull nose up), ArrowDown (push nose down)
-    inputs.elevator = (keyState.has('ArrowUp') ? -1 : 0) + (keyState.has('ArrowDown') ? 1 : 0)
-    inputs.elevator = Math.max(-1, Math.min(1, inputs.elevator))
+    if (keyState.has('ArrowUp') || keyState.has('ArrowDown')) {
+        inputs.elevator = (keyState.has('ArrowUp') ? -1 : 0) + (keyState.has('ArrowDown') ? 1 : 0)
+        inputs.elevator = Math.max(-1, Math.min(1, inputs.elevator))
+    }
     // Ailerons: ArrowLeft, ArrowRight (Right roll with Right)
-    inputs.ailerons = (keyState.has('ArrowRight') ? 1 : 0) + (keyState.has('ArrowLeft') ? -1 : 0)
-    inputs.ailerons = Math.max(-1, Math.min(1, inputs.ailerons))
+    if (keyState.has('ArrowLeft') || keyState.has('ArrowRight')) {
+        inputs.ailerons = (keyState.has('ArrowRight') ? 1 : 0) + (keyState.has('ArrowLeft') ? -1 : 0)
+        inputs.ailerons = Math.max(-1, Math.min(1, inputs.ailerons))
+    }
     // Rudder: Q (left), E (right)
-    inputs.rudder = (keyState.has('e') || keyState.has('E') ? 1 : 0) + (keyState.has('q') || keyState.has('Q') ? -1 : 0)
-    inputs.rudder = Math.max(-1, Math.min(1, inputs.rudder))
-    // Throttle: Z decrease, X increase
+    if (keyState.has('e') || keyState.has('E') || keyState.has('q') || keyState.has('Q')) {
+        inputs.rudder = (keyState.has('e') || keyState.has('E') ? 1 : 0) + (keyState.has('q') || keyState.has('Q') ? -1 : 0)
+        inputs.rudder = Math.max(-1, Math.min(1, inputs.rudder))
+    }
+    // Throttle: Z decrease, X increase (additive)
     if (keyState.has('x') || keyState.has('X')) inputs.throttle = Math.min(1, inputs.throttle + 0.5 / 60)
     if (keyState.has('z') || keyState.has('Z')) inputs.throttle = Math.max(0, inputs.throttle - 0.5 / 60)
+}
+
+// Programmatic controls for automated tests and external integrations
+;(window as any).CONTROLS = {
+    set(partial: Partial<ControlInputs>) {
+        if (partial.elevator !== undefined) inputs.elevator = clamp(partial.elevator, -1, 1)
+        if (partial.ailerons !== undefined) inputs.ailerons = clamp(partial.ailerons, -1, 1)
+        if (partial.rudder !== undefined) inputs.rudder = clamp(partial.rudder, -1, 1)
+        if (partial.throttle !== undefined) inputs.throttle = clamp(partial.throttle, 0, 1)
+    },
+    get(): ControlInputs {
+        return { ...inputs }
+    },
+    setPitchHoldDeg(target: number | null) {
+        if (target === null || Number.isFinite(target)) {
+            pitchHoldTargetDeg = target as any
+        }
+    }
+}
+
+// Provide deterministic test tuning helper
+;(window as any).SIM = {
+    setAeroScale: (s: { lift?: number; drag?: number }) => fdm.setAeroScale(s)
+}
+
+// Camera view management
+type CameraMode = 'chase' | 'cockpit' | 'free'
+let cameraMode: CameraMode = 'chase'
+function setCameraMode(mode: CameraMode) {
+    cameraMode = mode
+    if (mode === 'chase') {
+        viewer.scene.camera.lookAtTransform(Matrix4.IDENTITY)
+        aircraft.viewFrom = new ConstantPositionProperty(new Cartesian3(0, 150, 20))
+        viewer.trackedEntity = aircraft
+    } else if (mode === 'free') {
+        viewer.trackedEntity = undefined
+        viewer.scene.camera.lookAtTransform(Matrix4.IDENTITY)
+    } else {
+        viewer.trackedEntity = undefined
+    }
+}
+
+window.addEventListener('keydown', e => {
+    if (e.key === '1') setCameraMode('chase')
+    if (e.key === '2') setCameraMode('cockpit')
+    if (e.key === '3') setCameraMode('free')
+})
+
+// Web Audio API: engine, wind, and ground-roll sounds
+let audioCtx: AudioContext | undefined
+let engineOsc: OscillatorNode | undefined
+let engineGain: GainNode | undefined
+let windSource: AudioBufferSourceNode | undefined
+let windFilter: BiquadFilterNode | undefined
+let windGain: GainNode | undefined
+let groundSource: AudioBufferSourceNode | undefined
+let groundFilter: BiquadFilterNode | undefined
+let groundGain: GainNode | undefined
+
+function createNoiseBuffer(ctx: AudioContext, seconds = 2): AudioBuffer {
+    const sampleRate = ctx.sampleRate
+    const length = Math.floor(sampleRate * seconds)
+    const buffer = ctx.createBuffer(1, length, sampleRate)
+    const data = buffer.getChannelData(0)
+    for (let i = 0; i < length; i++) data[i] = Math.random() * 2 - 1
+    return buffer
+}
+
+function initAudioIfNeeded() {
+    if (audioCtx) return
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
+    audioCtx = ctx
+
+    // Master limiter-ish
+    const master = ctx.createGain()
+    master.gain.value = 0.8
+    master.connect(ctx.destination)
+
+    // Engine: sawtooth oscillator through lowpass
+    engineOsc = ctx.createOscillator()
+    engineOsc.type = 'sawtooth'
+    const engineFilter = ctx.createBiquadFilter()
+    engineFilter.type = 'lowpass'
+    engineFilter.frequency.value = 1200
+    engineGain = ctx.createGain()
+    engineGain.gain.value = 0
+    engineOsc.connect(engineFilter)
+    engineFilter.connect(engineGain)
+    engineGain.connect(master)
+    engineOsc.start()
+
+    // Wind: white noise through bandpass
+    windSource = ctx.createBufferSource()
+    windSource.buffer = createNoiseBuffer(ctx, 3)
+    windSource.loop = true
+    windFilter = ctx.createBiquadFilter()
+    windFilter.type = 'bandpass'
+    windFilter.frequency.value = 500
+    windFilter.Q.value = 0.7
+    windGain = ctx.createGain()
+    windGain.gain.value = 0
+    windSource.connect(windFilter)
+    windFilter.connect(windGain)
+    windGain.connect(master)
+    windSource.start()
+
+    // Ground roll: white noise through lowpass
+    groundSource = ctx.createBufferSource()
+    groundSource.buffer = createNoiseBuffer(ctx, 3)
+    groundSource.loop = true
+    groundFilter = ctx.createBiquadFilter()
+    groundFilter.type = 'lowpass'
+    groundFilter.frequency.value = 300
+    groundGain = ctx.createGain()
+    groundGain.gain.value = 0
+    groundSource.connect(groundFilter)
+    groundFilter.connect(groundGain)
+    groundGain.connect(master)
+    groundSource.start()
+}
+
+// Unlock audio on first user interaction
+window.addEventListener('keydown', initAudioIfNeeded, { once: true })
+viewerContainer.addEventListener('pointerdown', initAudioIfNeeded, { once: true })
+
+// Lightweight performance telemetry
+let fpsEma = 60
+let fdmMsEma = 0
+let lastPerfNowMs = performance.now()
+const perfAlpha = 0.1
+;(window as any).PERF = {
+    getFps: () => fpsEma,
+    getFdmMs: () => fdmMsEma
 }
 
 // On-tick simulation update driving the aircraft entity over time (like the tutorial, but procedural)
 let lastTime: JulianDate | undefined
 viewer.clock.onTick.addEventListener(clock => {
+    // FPS estimate using wall-clock between ticks
+    const nowPerf = performance.now()
+    const frameMs = nowPerf - lastPerfNowMs
+    lastPerfNowMs = nowPerf
+    if (frameMs > 0 && Number.isFinite(frameMs)) {
+        const instFps = 1000 / frameMs
+        fpsEma = (1 - perfAlpha) * fpsEma + perfAlpha * instFps
+    }
     const now = clock.currentTime
     if (!lastTime) {
         lastTime = JulianDate.clone(now)
@@ -156,7 +315,20 @@ viewer.clock.onTick.addEventListener(clock => {
     if (dt > 0.1) dt = 0.1
 
     updateInputsFromKeyboard()
+    // Simple pitch hold (positive elevator commands nose-up)
+    if (pitchHoldTargetDeg !== null) {
+        const currentPitchDeg = fdm.state.pitchRad * 180 / Math.PI
+        const errorDeg = (pitchHoldTargetDeg as number) - currentPitchDeg
+        const kp = 0.06
+        inputs.elevator = clamp(kp * errorDeg, -1, 1)
+    }
+    const t0 = performance.now()
     fdm.update(dt, inputs)
+    const t1 = performance.now()
+    const fdmMs = t1 - t0
+    if (Number.isFinite(fdmMs)) {
+        fdmMsEma = (1 - perfAlpha) * fdmMsEma + perfAlpha * fdmMs
+    }
 
     // Compute world position from local ENU offset
     const localOffset = new Cartesian3(
@@ -173,6 +345,13 @@ viewer.clock.onTick.addEventListener(clock => {
 
     aircraft.position = new ConstantPositionProperty(worldPosition)
     aircraft.orientation = new ConstantProperty(orientation)
+
+    // Camera per-mode handling
+    if (cameraMode === 'cockpit') {
+        const modelMatrix = Transforms.headingPitchRollToFixedFrame(worldPosition, hpr)
+        // Slightly forward and above nose; tune for your model
+        viewer.scene.camera.lookAtTransform(modelMatrix, new Cartesian3(1.8, 0, 1.2))
+    }
 
     // Publish HUD state
     const vel = fdm.state.velocityEnuMetersPerSec
@@ -194,6 +373,26 @@ viewer.clock.onTick.addEventListener(clock => {
         headingDeg,
         throttle01: inputs.throttle
     })
+
+    // Update audio parameters if initialized
+    if (audioCtx) {
+        // Engine pitch and loudness tied to throttle and speed
+        const t = Math.max(0, Math.min(1, inputs.throttle))
+        const rpmHz = 40 + 260 * t
+        if (engineOsc) (engineOsc as OscillatorNode).frequency.value = rpmHz
+        if (engineGain) (engineGain as GainNode).gain.value = 0.05 + 0.15 * t
+
+        // Wind noise scales with airspeed (quadratic-ish), clamp to safe range
+        const windStrength = Math.min(1, (speedMS / 80) ** 2)
+        if (windFilter) (windFilter as BiquadFilterNode).frequency.value = 400 + 1200 * windStrength
+        if (windGain) (windGain as GainNode).gain.value = 0.02 + 0.25 * windStrength
+
+        // Ground roll when near ground with forward speed
+        const onGround = altitudeM < 1.5
+        const rollStrength = onGround ? Math.min(1, speedMS / 25) : 0
+        if (groundFilter) (groundFilter as BiquadFilterNode).frequency.value = 200 + 400 * rollStrength
+        if (groundGain) (groundGain as GainNode).gain.value = 0.0 + 0.3 * rollStrength
+    }
 })
 
 // Cesium handles resizing automatically via the underlying widget
