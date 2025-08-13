@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Flight Simulator</title>
+  </head>
+  <body>
+    <div id="viewer"></div>
+    <div id="hud" class="hud">
+      <div class="hud-row">
+        <div class="hud-box">
+          <div class="hud-label">Airspeed</div>
+          <div class="hud-value"><span id="asi">0</span> kt</div>
+        </div>
+        <div class="hud-box">
+          <div class="hud-label">Altitude</div>
+          <div class="hud-value"><span id="alt">0</span> ft</div>
+        </div>
+        <div class="hud-box">
+          <div class="hud-label">Heading</div>
+          <div class="hud-value"><span id="hdg">000</span>°</div>
+        </div>
+        <div class="hud-box">
+          <div class="hud-label">Pitch/Roll</div>
+          <div class="hud-value"><span id="att">0/0</span>°</div>
+        </div>
+        <div class="hud-box">
+          <div class="hud-label">Throttle</div>
+          <div class="hud-value"><span id="thr">0</span>%</div>
+          <div class="thr-bar"><div id="thrFill" class="thr-fill"></div></div>
+        </div>
+      </div>
+      <div class="hud-att">
+        <div id="ai" class="ai">
+          <div class="ai-sky"></div>
+          <div class="ai-ground"></div>
+          <div class="ai-horizon"></div>
+          <div class="ai-ring"></div>
+          <div class="ai-index"></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
